@@ -32,7 +32,17 @@ MODES = {
 }
 
 CONF_THRESHOLD = 80
-BINANCE_BASE = 'https://api.binance.com/api/v3/klines'
+# Plusieurs endpoints Binance — on essaie dans l'ordre jusqu'à ce qu'un réponde.
+# data-api.binance.vision est l'endpoint public de données, rarement géo-bloqué.
+BINANCE_ENDPOINTS = [
+    'https://data-api.binance.vision/api/v3/klines',
+    'https://api.binance.com/api/v3/klines',
+    'https://api1.binance.com/api/v3/klines',
+    'https://api2.binance.com/api/v3/klines',
+    'https://api3.binance.com/api/v3/klines',
+]
+# Mémorise l'endpoint qui marche pour ne pas retester à chaque fois
+working_endpoint = [None]
 
 # Mémoire anti-doublon : ne pas renvoyer la même alerte dans les 15 min
 last_alerts = {}  # clé: "PAIR_MODE_DIR" -> timestamp
@@ -270,13 +280,9 @@ def compute_signal(dT, dE, dC, mode_key):
 
 
 # ══════════════════════════════════════════════════════
-# DONNÉES BINANCE
+# DONNÉES BINANCE — multi-endpoints avec bascule automatique
 # ══════════════════════════════════════════════════════
-def fetch_klines(pair, interval):
-    url = f"{BINANCE_BASE}?symbol={pair}&interval={interval}&limit=150"
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    d = r.json()
+def _parse_klines(d):
     return {
         'closes': [float(c[4]) for c in d],
         'highs': [float(c[2]) for c in d],
@@ -284,11 +290,35 @@ def fetch_klines(pair, interval):
         'vols': [float(c[5]) for c in d],
     }
 
+def fetch_klines(pair, interval):
+    params = f"?symbol={pair}&interval={interval}&limit=150"
+    # On commence par l'endpoint qui a marché la dernière fois
+    endpoints = BINANCE_ENDPOINTS[:]
+    if working_endpoint[0] in endpoints:
+        endpoints.remove(working_endpoint[0])
+        endpoints.insert(0, working_endpoint[0])
+
+    last_err = None
+    for base in endpoints:
+        try:
+            r = requests.get(base + params, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code == 451 or r.status_code == 403:
+                last_err = f"{r.status_code} bloqué"
+                continue  # endpoint géo-bloqué, on essaie le suivant
+            r.raise_for_status()
+            working_endpoint[0] = base  # mémorise l'endpoint qui marche
+            return _parse_klines(r.json())
+        except Exception as e:
+            last_err = str(e)
+            continue
+    # Aucun endpoint n'a répondu
+    raise RuntimeError(f"Tous les endpoints Binance ont échoué ({last_err})")
+
 
 # ══════════════════════════════════════════════════════
 # TELEGRAM
 # ══════════════════════════════════════════════════════
-def send_telegram(text):
+def send_telegram(text, buttons=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
@@ -296,6 +326,14 @@ def send_telegram(text):
         'parse_mode': 'HTML',
         'disable_web_page_preview': True,
     }
+    # buttons = liste de lignes, chaque ligne = liste de (label, url)
+    if buttons:
+        payload['reply_markup'] = {
+            'inline_keyboard': [
+                [{'text': label, 'url': link} for (label, link) in row]
+                for row in buttons
+            ]
+        }
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
@@ -330,6 +368,11 @@ def format_alert(pair, mode_key, sig):
     fresh = "✅ frais" if sig['isFresh'] else "signal mûr"
     now = datetime.now().strftime("%H:%M")
 
+    # Lien raccourci iOS (ouvre l'app BingX, session active) — cliquable dans le corps du message
+    shortcut_link = "shortcuts://run-shortcut?name=BingX"
+    # Lien web de secours (ouvre le navigateur sur la bonne paire)
+    web_link = f"https://bingx.com/en/perpetual/{short}-USDT/"
+
     msg = (
         f"{arrow} <b>{direction} {short}/USDT</b>\n"
         f"{mode_label} · Confiance <b>{sig['conf']}%</b> · {now} · {fresh}\n"
@@ -340,9 +383,12 @@ def format_alert(pair, mode_key, sig):
         f"━━━━━━━━━━━━━━━\n"
         f"💰 Mise : <b>{trade_amt:.0f}€</b> · Levier : <b>×{lev}</b> · R/R : <b>1:{sig['rr']:.1f}</b>\n"
         f"📊 BK : {CAPITAL}€ · Order Value BingX : <b>{trade_amt * lev:.0f} USDT</b>\n\n"
+        f'👉 <a href="{shortcut_link}">📲 Ouvrir l\'app BingX</a>\n'
         f"⚠️ Vérifie le signal avant d'entrer — il peut avoir changé."
     )
-    return msg
+    # Bouton de secours web (https obligatoire pour les boutons Telegram)
+    buttons = [[("🌐 BingX " + short + " (web)", web_link)]]
+    return msg, buttons
 
 
 # ══════════════════════════════════════════════════════
@@ -366,8 +412,8 @@ def scan_mode(mode_key):
                     print(f"  ↳ {pair} {direction} ({mode_key}) — doublon ignoré")
                     continue
                 last_alerts[key] = now
-                msg = format_alert(pair, mode_key, sig)
-                send_telegram(msg)
+                msg, buttons = format_alert(pair, mode_key, sig)
+                send_telegram(msg, buttons)
                 print(f"  ✅ ALERTE {pair} {direction} ({mode_key}) conf {sig['conf']}%")
             else:
                 status = "range" if sig['ranging'] else f"{sig['conf']}%"
@@ -388,30 +434,55 @@ def main():
         "🚀 <b>ScalpRadar Bot démarré</b>\n"
         f"Surveillance de {len(PAIRS)} paires\n"
         f"Scalp : {'✅' if SCALP_ENABLED else '❌'} · Swing : {'✅' if SWING_ENABLED else '❌'}\n"
-        "Tu recevras une notif à chaque signal validé."
+        "Tu recevras une notif à chaque signal validé.\n\n"
+        '👉 <a href="shortcuts://run-shortcut?name=BingX">📲 Tester l\'ouverture de BingX</a>'
     )
+
+    # Test de connectivité au démarrage : vérifie qu'au moins un endpoint répond
+    try:
+        test = fetch_klines('BTCUSDT', '1h')
+        print(f"✓ Connexion Binance OK via {working_endpoint[0]}")
+        send_telegram(f"✅ Connexion aux données marché OK\nEndpoint actif : {working_endpoint[0].replace('https://','').split('/')[0]}")
+    except Exception as e:
+        print(f"⚠ Aucun endpoint Binance accessible : {e}")
+        send_telegram(
+            "⚠️ <b>Attention</b> : impossible d'accéder aux données Binance depuis ce serveur.\n"
+            "Le bot continue d'essayer, mais il faudra peut-être changer la région du serveur Railway."
+        )
 
     last_scalp = 0
     last_swing = 0
 
     while True:
-        now = time.time()
-        if SCALP_ENABLED and (now - last_scalp) >= MODES['scalp']['cycle']:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scan SCALP")
-            scan_mode('scalp')
-            last_scalp = now
-        if SWING_ENABLED and (now - last_swing) >= MODES['swing']['cycle']:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scan SWING")
-            scan_mode('swing')
-            last_swing = now
-        time.sleep(5)
+        try:
+            now = time.time()
+            if SCALP_ENABLED and (now - last_scalp) >= MODES['scalp']['cycle']:
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scan SCALP")
+                scan_mode('scalp')
+                last_scalp = now
+            if SWING_ENABLED and (now - last_swing) >= MODES['swing']['cycle']:
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scan SWING")
+                scan_mode('swing')
+                last_swing = now
+            time.sleep(5)
+        except Exception as e:
+            # Le bot ne s'arrête JAMAIS sur une erreur — il log et continue
+            print(f"⚠ Erreur dans la boucle (ignorée) : {e}")
+            time.sleep(10)
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nBot arrêté.")
-    except Exception as e:
-        print(f"Erreur fatale : {e}")
-        send_telegram(f"⚠️ <b>Bot arrêté</b> : {e}")
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            print("\nBot arrêté manuellement.")
+            break
+        except Exception as e:
+            # En cas d'erreur fatale, on redémarre automatiquement après 15s
+            print(f"Erreur fatale : {e} — redémarrage dans 15s")
+            try:
+                send_telegram(f"⚠️ <b>Bot a rencontré une erreur</b> : {e}\nRedémarrage automatique...")
+            except Exception:
+                pass
+            time.sleep(15)
