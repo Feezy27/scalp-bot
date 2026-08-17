@@ -13,7 +13,7 @@ TELEGRAM_CHAT_ID = "1766086477"
 # ── TES PARAMÈTRES DE TRADING ──
 CAPITAL = 38         # Ta bankroll totale en €
 ALLOC_PCT = 50       # % de la BK par trade (50 = la moitié)
-RISK_PCT = 5         # % de risque max sur la MISE (pas la BK totale)
+RISK_PCT = 2.5         # % de risque max sur la MISE (pas la BK totale)
 
 # ── PAIRES À SURVEILLER ──
 PAIRS = [
