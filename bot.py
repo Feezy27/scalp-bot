@@ -27,8 +27,25 @@ from config import (
 
 # ── PARAMÈTRES DES MODES (identiques à l'app) ──
 MODES = {
-    'scalp': {'trend': '1h', 'entry': '5m', 'confirm': '15m', 'atrTP': 2.5, 'atrSL': 1.5, 'cycle': 90},
-    'swing': {'trend': '4h', 'entry': '1h', 'confirm': '15m', 'atrTP': 3.5, 'atrSL': 1.8, 'cycle': 300},
+    'scalp': {
+        'trend': '1h', 'entry': '5m', 'confirm': '15m',
+        'atrTP': 2.5, 'atrSL': 1.5, 'cycle': 90,
+        # ── Garde-fous de gestion du risque ──
+        'sl_buffer': 0.6,   # marge sous le creux (en ATR) — respiration du marché
+        'sl_min': 1.3,      # SL JAMAIS plus proche que 1.3 ATR de l'entrée
+        'sl_max': 3.0,      # SL jamais plus loin que 3.0 ATR
+        'lev_max': 5,       # levier plafonné à ×5 en scalp
+        'rr': 1.8,          # ratio risque/récompense visé
+    },
+    'swing': {
+        'trend': '4h', 'entry': '1h', 'confirm': '15m',
+        'atrTP': 3.5, 'atrSL': 1.8, 'cycle': 300,
+        'sl_buffer': 0.7,
+        'sl_min': 1.5,
+        'sl_max': 3.5,
+        'lev_max': 8,       # levier plafonné à ×8 en swing
+        'rr': 2.0,
+    },
 }
 
 CONF_THRESHOLD = 80
@@ -236,18 +253,29 @@ def compute_signal(dT, dE, dC, mode_key):
         if entry_limit - price > atr_val * 0.6:
             entry_limit = price
 
-    # SL structurel + TP en R/R 1.8
+    # ── SL STRUCTUREL AVEC DISTANCE MINIMALE (correction majeure) ──
+    # Avant : le SL pouvait coller au prix si le creux était proche → sortie sur le bruit.
+    # Maintenant : le SL est encadré entre sl_min et sl_max ATR de l'entrée.
     entry_ref = entry_limit
+    buf     = cfg['sl_buffer']
+    sl_min  = cfg['sl_min']
+    sl_max  = cfg['sl_max']
+    rr_target = cfg['rr']
+
     if is_long:
         swing = last_swing_low(dE['lows'], 20)
-        sl = max(swing - atr_val * 0.3, entry_ref - atr_val * 2.2)
+        sl = swing - atr_val * buf              # SL sous le dernier creux + marge
+        sl = max(sl, entry_ref - atr_val * sl_max)  # pas trop loin (limite la perte)
+        sl = min(sl, entry_ref - atr_val * sl_min)  # pas trop près (absorbe le bruit)
         risk = entry_ref - sl
-        tp = entry_ref + risk * 1.8
+        tp = entry_ref + risk * rr_target
     elif is_short:
         swing = last_swing_high(dE['highs'], 20)
-        sl = min(swing + atr_val * 0.3, entry_ref + atr_val * 2.2)
+        sl = swing + atr_val * buf
+        sl = min(sl, entry_ref + atr_val * sl_max)
+        sl = max(sl, entry_ref + atr_val * sl_min)
         risk = sl - entry_ref
-        tp = entry_ref - risk * 1.8
+        tp = entry_ref - risk * rr_target
     else:
         tp = price + atr_val * cfg['atrTP']
         sl = price - atr_val * cfg['atrSL']
@@ -354,15 +382,22 @@ def format_alert(pair, mode_key, sig):
     mode_label = '⚡ Scalp' if mode_key == 'scalp' else '📈 Swing'
     short = pair.replace('USDT', '')
 
+    cfg = MODES[mode_key]
     trade_amt = CAPITAL * ALLOC_PCT / 100
     sl_dist = abs((sig['sl'] - sig['entry']) / sig['entry'] * 100)
     target_loss = trade_amt * RISK_PCT / 100
-    lev = max(1, min(20, round(target_loss / (trade_amt * sl_dist / 100)))) if sl_dist > 0 else 1
+
+    # ── LEVIER PLAFONNÉ PAR MODE (correction majeure) ──
+    # Avant : jusqu'à ×20 → le bruit du marché suffisait à déclencher le SL.
+    lev_theorique = round(target_loss / (trade_amt * sl_dist / 100)) if sl_dist > 0 else 1
+    lev = max(1, min(cfg['lev_max'], lev_theorique))
 
     tp_pct = (sig['tp'] - sig['entry']) / sig['entry'] * 100
     sl_pct = (sig['sl'] - sig['entry']) / sig['entry'] * 100
-    gain = trade_amt * abs(tp_pct) / 100
-    loss = trade_amt * abs(sl_pct) / 100
+    # ── GAIN/PERTE RÉELS : le levier multiplie le résultat (correction) ──
+    gain = trade_amt * lev * abs(tp_pct) / 100
+    loss = trade_amt * lev * abs(sl_pct) / 100
+    loss_pct_bk = loss / CAPITAL * 100  # perte en % de la bankroll totale
 
     entry_type = "au marché" if sig['entryAtMarket'] else "LIMITE (attends le pullback)"
     fresh = "✅ frais" if sig['isFresh'] else "signal mûr"
@@ -379,9 +414,9 @@ def format_alert(pair, mode_key, sig):
         f"━━━━━━━━━━━━━━━\n"
         f"🎯 Entrée ({entry_type}) : <b>{fmt_price(sig['entry'])}</b>\n"
         f"✅ TP : <b>{fmt_price(sig['tp'])}</b> ({tp_pct:+.2f}%) → +{gain:.2f}€\n"
-        f"🛑 SL : <b>{fmt_price(sig['sl'])}</b> ({sl_pct:+.2f}%) → -{loss:.2f}€\n"
+        f"🛑 SL : <b>{fmt_price(sig['sl'])}</b> ({sl_pct:+.2f}%) → -{loss:.2f}€ ({loss_pct_bk:.1f}% BK)\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"💰 Mise : <b>{trade_amt:.0f}€</b> · Levier : <b>×{lev}</b> · R/R : <b>1:{sig['rr']:.1f}</b>\n"
+        f"💰 Mise : <b>{trade_amt:.0f}€</b> · Levier : <b>×{lev}</b> (max ×{cfg['lev_max']}) · R/R : <b>1:{sig['rr']:.1f}</b>\n"
         f"📊 BK : {CAPITAL}€ · Order Value BingX : <b>{trade_amt * lev:.0f} USDT</b>\n\n"
         f'👉 <a href="{shortcut_link}">📲 Ouvrir l\'app BingX</a>\n'
         f"⚠️ Vérifie le signal avant d'entrer — il peut avoir changé."
