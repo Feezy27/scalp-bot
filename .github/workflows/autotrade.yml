@@ -1,0 +1,53 @@
+name: ScalpRadar AutoTrade
+
+on:
+  schedule:
+    # Toutes les 15 minutes (heure UTC)
+    - cron: "*/15 * * * *"
+  workflow_dispatch:        # permet de lancer a la main depuis l'onglet Actions
+
+# Empeche deux executions de se chevaucher
+concurrency:
+  group: autotrade
+  cancel-in-progress: false
+
+permissions:
+  contents: write           # necessaire pour sauvegarder state.json
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dependances
+        run: pip install requests
+
+      - name: Lancer le bot
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BINGX_API_KEY:    ${{ secrets.BINGX_API_KEY }}
+          BINGX_API_SECRET: ${{ secrets.BINGX_API_SECRET }}
+        run: python autotrade.py
+
+      - name: Sauvegarder l'etat
+        run: |
+          git config user.name  "scalpradar-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json
+          if git diff --staged --quiet; then
+            echo "Aucun changement d'etat."
+          else
+            git commit -m "state: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git pull --rebase --autostash || true
+            git push || echo "Push impossible, sera reessaye au prochain run."
+          fi
