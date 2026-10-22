@@ -1,0 +1,13 @@
+{
+  "bankroll": 40.0,
+  "enabled": true,
+  "day": "2026-10-22",
+  "daily_pnl": 0.0,
+  "trades_today": 0,
+  "consecutive_losses": 0,
+  "open_position": null,
+  "tg_offset": 0,
+  "history": [],
+  "total_trades": 0,
+  "total_wins": 0
+}
