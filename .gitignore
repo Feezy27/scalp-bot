@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+backtest/data2/
+backtest/data/
